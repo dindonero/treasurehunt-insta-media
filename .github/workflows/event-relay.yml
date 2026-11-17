@@ -1,0 +1,71 @@
+name: Event relay (clock for treasurehunt-insta-bot)
+
+# GitHub never fired the private bot repo's */15 event-countdown cron, and a sleeping job
+# there would burn its private Actions minutes. This PUBLIC repo has free minutes, so the
+# clock lives here: the job sleeps until each slot (+60 s), then pushes an empty commit
+# (same tree as main) to the bot repo's `event-trigger` branch with the deploy key in
+# secret BOT_TRIGGER_KEY. That push starts event-countdown.yml there, which posts whatever
+# slot is due and records it, so an extra trigger can never double-post.
+# A run sleeps at most ~5.6 h, then re-dispatches itself with the slots still ahead.
+# Start (slots sorted, UTC):
+#   gh workflow run event-relay.yml -R dindonero/treasurehunt-insta-media \
+#     -f slots=2026-11-18T12:30:00Z,2026-11-18T18:30:00Z
+on:
+  workflow_dispatch:
+    inputs:
+      slots:
+        description: "Comma-separated slot times, ISO UTC, ascending"
+        required: true
+
+permissions:
+  actions: write   # to re-dispatch itself (allowed for GITHUB_TOKEN)
+
+concurrency:
+  group: event-relay
+  cancel-in-progress: true   # only the newest chain survives
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Sleep until each slot, then trigger the bot
+        env:
+          SLOTS: ${{ inputs.slots }}
+          KEY: ${{ secrets.BOT_TRIGGER_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/k" && chmod 600 "$RUNNER_TEMP/k"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/k -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          export GIT_AUTHOR_NAME=event-relay GIT_AUTHOR_EMAIL=bot@treasurehunt.pt
+          export GIT_COMMITTER_NAME=event-relay GIT_COMMITTER_EMAIL=bot@treasurehunt.pt
+          trigger() {   # tree-only clone: no media blobs are downloaded
+            for try in 1 2 3; do
+              rm -rf "$RUNNER_TEMP/bot"
+              if git clone -q --depth 1 --filter=blob:none --no-checkout --branch main \
+                   git@github.com:dindonero/treasurehunt-insta-bot.git "$RUNNER_TEMP/bot" &&
+                 c=$(git -C "$RUNNER_TEMP/bot" commit-tree 'HEAD^{tree}' -p HEAD -m "trigger event-countdown for $1") &&
+                 git -C "$RUNNER_TEMP/bot" push -q -f origin "$c:refs/heads/event-trigger"; then
+                echo "triggered for $1 at $(date -u +%FT%TZ)"; return 0
+              fi
+              sleep 30
+            done
+            echo "::error::could not trigger for $1"
+          }
+          deadline=$(( $(date +%s) + 335 * 60 ))
+          left=""
+          for s in $(echo "$SLOTS" | tr ',' ' '); do
+            t=$(( $(date -d "$s" +%s) + 60 ))
+            now=$(date +%s)
+            if [ "$t" -gt "$deadline" ]; then left="$left,$s"; continue; fi
+            if [ "$t" -lt $(( now - 90 * 60 )) ]; then echo "skip $s (over 90 min past)"; continue; fi
+            if [ "$t" -gt "$now" ]; then echo "sleeping until $s"; sleep $(( t - now )); fi
+            trigger "$s"
+          done
+          rm -f "$RUNNER_TEMP/k"
+          if [ -n "$left" ]; then
+            now=$(date +%s); [ "$deadline" -gt "$now" ] && sleep $(( deadline - now ))
+            gh workflow run event-relay.yml -R "$GITHUB_REPOSITORY" -f slots="${left#,}"
+            echo "re-dispatched with ${left#,}"
+          fi
